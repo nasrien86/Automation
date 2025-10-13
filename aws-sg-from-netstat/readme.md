@@ -5,7 +5,7 @@
 This Python script automates the creation of **AWS Security Groups and rules** based on data extracted from a cleaned Excel netstat report.
 
 It supports:
-- Multi-sheet Excel files (`.xlsx`)
+- Excel files (`.xlsx`)
 - Automatic header mapping (no strict column names)
 - IPv4 and IPv6 CIDRs
 - Inbound and outbound rules
