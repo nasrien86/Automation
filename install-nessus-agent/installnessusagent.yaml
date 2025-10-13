@@ -1,1 +1,327 @@
+schemaVersion: '0.3'
+description: Install Nessus Agent on all SSM Managed Instances (Windows and Linux) if not installed.
+assumeRole: '{{ AssumeRole }}'
+parameters:
+  AssumeRole:
+    type: String
+    description: (Required) The ARN of the role that allows Automation to assume.
+  key:
+    type: String
+    description: Key for linking the Nessus Agent
+  port:
+    type: String
+    description: Port number for linking the Nessus Agent
+  host:
+    type: String
+    description: Host name for linking the nessus agent
+mainSteps:
+  - name: GetOSFlavor
+    action: aws:executeScript
+    nextStep: InstallNessusAgent_Windows
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      Script: |
+        import boto3
+
+        def script_handler(event, context):
+            # Initialize boto3 clients
+            ssm = boto3.client('ssm')
+            ec2 = boto3.client('ec2')
+
+            linux_instances = []
+            windows_instances = []
+
+            instance_versions = {}
+            instance_architectures = {}
+
+            # Supported Windows and Linux versions and architecture
+            supported_windows_versions = ['windows server 2012', 'windows server 2012 r2', 'windows server 2016', 'windows server 2019', 'windows server 2022', 'windows 10', 'windows 11']
+            supported_linux_versions = {
+                '7': ['red hat', 'centos', 'oracle'],
+                '8': ['red hat', 'alma', 'rocky', 'oracle'],
+                '9': ['red hat', 'alma', 'rocky', 'oracle', 'centos stream']
+            }
+            supported_architecture = 'x86_64'  # Common architecture
+
+            # Function to check if the instance version and architecture are supported
+            def is_supported_instance(platform_name, platform_version, supported_versions, architecture):
+                major_version = platform_version.split('.')[0]
+                return (any(distro in platform_name for distro in supported_versions.get(major_version, []))
+                        and architecture == supported_architecture)
+
+            # Function to print reason for exclusion
+            def print_exclusion_reason(instance_id, reason):
+                print(f"Instance {instance_id} not added due to: {reason}")
+
+            # Step 1: Retrieve instance information from SSM and check if ping status is Online
+            token = None
+            instance_ids = []
+
+            while True:
+                response = ssm.describe_instance_information(NextToken=token) if token else ssm.describe_instance_information()
+                
+                for instance_info in response['InstanceInformationList']:
+                    instance_id = instance_info['InstanceId']
+                    platform_type = instance_info['PlatformType']
+                    platform_name = instance_info.get('PlatformName', '').lower()
+                    platform_version = instance_info.get('PlatformVersion', 'Unknown')
+                    ping_status = instance_info['PingStatus']  # Check Ping status
+
+                    # Only proceed if the instance is Online in SSM
+                    if ping_status != "Online":
+                        print_exclusion_reason(instance_id, "Instance is not online in Fleet Manager")
+                        continue
+
+                    # Step 2: Check if instance has the tag 'Nessus: yes'
+                    tags_response = ec2.describe_tags(Filters=[
+                        {'Name': 'resource-id', 'Values': [instance_id]},
+                        {'Name': 'key', 'Values': ['Nessus']},
+                        {'Name': 'value', 'Values': ['yes']}
+                    ])
+
+                    if not tags_response['Tags']:
+                        print_exclusion_reason(instance_id, "Instance does not have the required Nessus: yes tag")
+                        continue
+
+                    # Log instance info for debugging
+                    print(f"Processing instance {instance_id}, Platform: {platform_name}, Version: {platform_version}, PingStatus: {ping_status}")
+
+                    # Store instance details for further processing
+                    instance_ids.append(instance_id)
+                    instance_versions[instance_id] = {
+                        'platform_name': platform_name,
+                        'platform_version': platform_version
+                    }
+
+                # Check if there are more instances (pagination)
+                token = response.get('NextToken')
+                if not token:
+                    break
+
+            # Step 3: Retrieve instance architecture and running status from EC2
+            if instance_ids:
+                ec2_response = ec2.describe_instances(InstanceIds=instance_ids, Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+                for reservation in ec2_response['Reservations']:
+                    for instance in reservation['Instances']:
+                        instance_id = instance['InstanceId']
+                        architecture = instance.get('Architecture', 'Unknown')
+                        print(f"Instance {instance_id} is running and has architecture: {architecture}")  # Debugging architecture
+                        instance_architectures[instance_id] = architecture
+
+            # Step 4: Process each instance and determine if it's supported
+            for instance_id, details in instance_versions.items():
+                platform_name = details['platform_name']
+                platform_version = details['platform_version']
+                architecture = instance_architectures.get(instance_id, 'Unknown')
+
+                # Linux (Red Hat, CentOS, Alma, Rocky, Oracle) instance check
+                if any(distro in platform_name for distro in ['red hat', 'centos', 'oracle', 'alma', 'rocky', 'centos stream']):
+                    if is_supported_instance(platform_name, platform_version, supported_linux_versions, architecture):
+                        linux_instances.append(instance_id)
+                    else:
+                        reason = f"Unsupported Linux distribution/version {platform_name} {platform_version}" if not is_supported_instance(platform_name, platform_version, supported_linux_versions, architecture) else f"Unsupported architecture {architecture}"
+                        print_exclusion_reason(instance_id, reason)
+
+                # Windows instance check
+                elif 'windows' in platform_name:
+                    if any(version in platform_name for version in supported_windows_versions) and architecture == supported_architecture:
+                        windows_instances.append(instance_id)
+                    else:
+                        reason = f"Unsupported Windows version {platform_name}" if not any(version in platform_name for version in supported_windows_versions) else f"Unsupported architecture {architecture}"
+                        print_exclusion_reason(instance_id, reason)
+
+                # Catch-all for other platforms
+                else:
+                    print_exclusion_reason(instance_id, "Unsupported platform type")
+
+            return {
+                'linuxInstances': linux_instances,
+                'windowsInstances': windows_instances
+            }
+    outputs:
+      - Type: StringList
+        Name: linuxInstances
+        Selector: $.Payload.linuxInstances
+      - Type: StringList
+        Name: windowsInstances
+        Selector: $.Payload.windowsInstances
+  - name: InstallNessusAgent_Windows
+    action: aws:executeScript
+    nextStep: InstallNessusAgent_OracleLinux_CentOS_RedHat
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      Script: |
+        import boto3
+
+        def script_handler(event, context):
+            ssm = boto3.client('ssm')
+
+            windows_instances = event['windows_instances']
+            key = event['key']
+            host = event['host']
+            port = event['port']
+
+            if not windows_instances:
+                print("No instance IDs found.")
+                return {"status": "No windows instances found."}
+
+            # Split into chunks of 50
+            def split_into_chunks(windows_instances, chunk_size=50):
+                for i in range(0, len(windows_instances), chunk_size):
+                    yield windows_instances[i:i + chunk_size]
+
+            commands_windows = [
+                # Force TLS 1.2 for secure connection
+                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+                "$nessusPath = 'C:\\Program Files\\Tenable\\Nessus Agent\\nessuscli.exe'",
+                "if (Test-Path $nessusPath) {",
+                "    Write-Host 'Nessus Agent is already installed.'",
+                "    # Check if Nessus agent is linked",
+                "    $link_status = & $nessusPath agent status | Select-String -Pattern 'Link status: Not linked to a manager'",
+                "    if ($link_status) {",
+                "        Write-Host 'Nessus Agent is installed but not linked. Linking now...'",
+                f"        & $nessusPath agent link --key={key} --host={host} --port={port} --groups=Default",
+                "    } else {",
+                "        Write-Host 'Nessus Agent is already linked.'",
+                "    }",
+                "} else {",
+                "    Write-Host 'Nessus Agent is not installed. Installing now...'",
+                f"    Invoke-WebRequest -Uri 'https://www.tenable.com/downloads/api/v2/pages/nessus-agents/files/NessusAgent-latest-x64.msi' -OutFile 'C:\\NessusAgent.msi'",
+                "    Start-Process msiexec.exe -ArgumentList '/i', 'C:\\NessusAgent.msi', '/norestart' -Wait",
+                "    Start-Service 'Tenable Nessus Agent'",
+                "    if (Test-Path $nessusPath) {",
+                "        Write-Host 'Nessus agent installed. Linking Nessus Agent'",
+                "        Remove-Item -Path 'C:\\NessusAgent.msi' -Force",
+                "        Write-Host 'Linking Nessus Agent'",
+                f"        & $nessusPath agent link --key={key} --host={host} --port={port} --groups=Default",
+                "        & $nessusPath --help",
+                "    } else {",
+                "        Write-Host 'Nessus CLI not found, there may have been an issue with the installation.'",
+                "    }",
+                "}"
+            ]
+
+            # Execute runCommand in chunks
+            for chunk in split_into_chunks(windows_instances):
+                ssm.send_command(
+                    InstanceIds=chunk,
+                    DocumentName="AWS-RunPowerShellScript",
+                    Parameters={"commands": commands_windows}
+                )
+                print(f"Sent commands to Windows instances: {chunk}")
+
+            return {"status": "Windows instances handled."}
+      InputPayload:
+        windows_instances: '{{ GetOSFlavor.windowsInstances }}'
+        key: '{{ key }}'
+        port: '{{ port }}'
+        host: '{{ host }}'
+  - name: InstallNessusAgent_OracleLinux_CentOS_RedHat
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |
+        import boto3
+
+        def script_handler(event, context):
+            ssm = boto3.client('ssm')
+
+            linux_instances = event['linux_instances']
+            key = event['key']
+            host = event['host']
+            port = event['port']
+
+            if not linux_instances:
+                print("No instance IDs found.")
+                return {"status": "No Linux instances found."}
+
+            # Split into chunks of 50
+            def split_into_chunks(linux_instances, chunk_size=50):
+                for i in range(0, len(linux_instances), chunk_size):
+                    yield linux_instances[i:i + chunk_size]
+
+            commands_linux = [
+                "#!/bin/bash",
+                "if [ -f /opt/nessus_agent/sbin/nessuscli ]; then",
+                "    echo 'Nessus Agent is already installed.'",
+                "    # Check if Nessus agent is linked",
+                "    link_status=$(/opt/nessus_agent/sbin/nessuscli agent status | grep -i 'Link status: Not linked to a manager')",
+                "    if [[ \"$link_status\" == *\"Link status: Not linked to a manager\"* ]]; then",
+                "        echo 'Nessus Agent is installed but not linked. Linking now...'",
+                f"        sudo /opt/nessus_agent/sbin/nessuscli agent link --key={key} --host={host} --port={port}",
+                "    else",
+                "        echo 'Nessus Agent is already linked.'",
+                "    fi",
+                "else",
+                "    echo 'Nessus Agent is not installed. Installing now...'",
+                "    sudo yum update -y || sudo dnf update -y > /dev/null 2>&1",
+                # Ensure wget is installed
+                "    if ! command -v wget &> /dev/null; then",
+                "        echo 'Installing wget...'",
+                "        sudo yum install wget -y || sudo dnf install wget -y",
+                "    fi",
+                # Get the major version of the OS
+                "    VERSION_ID=$(grep '^VERSION_ID=' /etc/os-release | cut -d '=' -f 2 | tr -d '\"')",
+                "    echo 'Version ID:' $VERSION_ID",
+                "    MAJOR_VERSION=${VERSION_ID%%.*}",  # Extract major version (before the dot)
+                "    echo 'MAJOR_VERSION:' $MAJOR_VERSION",
+                "    if [ $MAJOR_VERSION = 9 ]; then",
+                "        echo 'Detected version 9. Installing appropriate package.'",
+                f"        PACKAGE_URL='https://www.tenable.com/downloads/api/v2/pages/nessus-agents/files/NessusAgent-latest-el9.x86_64.rpm'",
+                f"        sudo wget -q $PACKAGE_URL -O /tmp/NessusAgent-latest-el9.x86_64.rpm",
+                f"        sudo dnf install -y /tmp/NessusAgent-latest-el9.x86_64.rpm",
+                "         rm -f /tmp/NessusAgent-latest-el9.x86_64.rpm",
+                "    elif [ $MAJOR_VERSION = 8 ]; then",
+                "        echo 'Detected version 8. Installing appropriate package.'",
+                f"        PACKAGE_URL='https://www.tenable.com/downloads/api/v2/pages/nessus-agents/files/NessusAgent-latest-el8.x86_64.rpm'",
+                f"        sudo wget -q $PACKAGE_URL -O /tmp/NessusAgent-latest-el8.x86_64.rpm",
+                f"        sudo dnf install -y /tmp/NessusAgent-latest-el8.x86_64.rpm",
+                "         rm -f /tmp/NessusAgent-latest-el8.x86_64.rpm",
+                "    elif [ $MAJOR_VERSION -le 7 ]; then",
+                "        echo 'Detected version 7. Installing appropriate package.'",
+                f"        PACKAGE_URL='https://www.tenable.com/downloads/api/v2/pages/nessus-agents/files/NessusAgent-latest-el7.x86_64.rpm'",
+                f"        sudo wget -q $PACKAGE_URL -O /tmp/NessusAgent-latest-el7.x86_64.rpm",
+                f"        sudo rpm -ivh /tmp/NessusAgent-latest-el7.x86_64.rpm",
+                "         rm -f /tmp/NessusAgent-latest-el7.x86_64.rpm",
+                "    else",
+                "        echo 'Unknown or unsupported OS version. Exiting...'",
+                "        exit 1",
+                "    fi",
+
+                # Start and enable Nessus Agent service
+                "    sudo systemctl enable nessusagent.service",
+                "    sudo systemctl start nessusagent.service",
+
+                # Verify the Nessus CLI installation
+                "    if [ -f /opt/nessus_agent/sbin/nessuscli ]; then",
+                "        echo 'Nessus Agent Installed and CLI found. Linking Nessus Agent'",
+                f"        sudo /opt/nessus_agent/sbin/nessuscli agent link --key={key} --host={host} --port={port}",
+                "    else",
+                "        echo 'Nessus CLI not found. There may have been an issue with the installation.'",
+                "        exit 1",
+                "    fi",
+                "fi"
+            ]
+
+            # Execute runCommand in chunks
+            for chunk in split_into_chunks(linux_instances):
+                ssm.send_command(
+                    InstanceIds=chunk,
+                    DocumentName="AWS-RunShellScript",
+                    Parameters={"commands": commands_linux}
+                )
+                print(f"Sent commands to Linux instances: {chunk}")
+
+            return {"status": "Linux instances handled."}
+      InputPayload:
+        linux_instances: '{{ GetOSFlavor.linuxInstances }}'
+        key: '{{ key }}'
+        port: '{{ port }}'
+        host: '{{ host }}'
 
