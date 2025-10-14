@@ -256,7 +256,34 @@ def main():
         print(f"Created SG: {sg_id}")
     else:
         sg_id = existing_sg_id
-
+    if to_add_egr:
+        # Revoke default outbound (All traffic) rule
+        try:
+            ec2.revoke_security_group_egress(
+                GroupId=sg_id,
+                IpPermissions=[
+                    {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+                ]
+            )
+            print("Removed default outbound rule (All traffic 0.0.0.0/0).")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "InvalidPermission.NotFound":
+                raise
+    else:
+        # No custom egress rules → ensure default outbound exists
+        try:
+            ec2.authorize_security_group_egress(
+                GroupId=sg_id,
+                IpPermissions=[
+                    {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+                ]
+            )
+            print("Added default outbound rule (All traffic 0.0.0.0/0).")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+                print("Default outbound rule already present.")
+            else:
+                raise
     if to_add_ing:
         try:
             ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=to_add_ing)
