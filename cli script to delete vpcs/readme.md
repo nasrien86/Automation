@@ -69,16 +69,3 @@ eu-north-1
 
 You can modify this array as needed.
 
-
-
-📦 Installation & Usage
-Clone the repository
-git clone https://github.com/nasrien86/Automation.git
-
-cd <repo-name>
-
-Make the script executable
-chmod +x cleanup-default-vpcs.sh
-
-Run the script
-./cleanup-default-vpcs.sh
