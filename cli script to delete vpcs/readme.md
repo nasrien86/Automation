@@ -68,3 +68,16 @@ eu-north-1
 
 
 You can modify this array as needed.
+
+
+
+📦 Installation & Usage
+Clone the repository
+git clone https://github.com/<your-username>/<repo-name>.git
+cd <repo-name>
+
+Make the script executable
+chmod +x cleanup-default-vpcs.sh
+
+Run the script
+./cleanup-default-vpcs.sh
